@@ -37,6 +37,12 @@ class LiveCutRuntime:
         gemini_bridge: GeminiLiveBridge | None = None,
         vlm_bridge: NvidiaVLMBridge | None = None,
         vlm_scene_switch_delay_seconds: float | None = None,
+        gemini_use_vlm_context: bool = True,
+        gemini_vlm_context_min_interval_seconds: float = 2.0,
+        gemini_chat_actions_only_in_chat_scene: bool = True,
+        gemini_require_wake_word: bool = False,
+        gemini_voice_wake_word: str = "gemini",
+        gemini_wake_window_seconds: float = 8.0,
     ) -> None:
         self.tools = tools
         self.host_username = host_username
@@ -57,6 +63,12 @@ class LiveCutRuntime:
         self.run_simulation_loops_with_gemini = run_simulation_loops_with_gemini
         self.gemini_bridge = gemini_bridge
         self.vlm_bridge = vlm_bridge
+        self.gemini_use_vlm_context = gemini_use_vlm_context
+        self.gemini_vlm_context_min_interval_seconds = max(0.0, float(gemini_vlm_context_min_interval_seconds))
+        self.gemini_chat_actions_only_in_chat_scene = gemini_chat_actions_only_in_chat_scene
+        self.gemini_require_wake_word = gemini_require_wake_word
+        self.gemini_voice_wake_word = (gemini_voice_wake_word or "gemini").strip().lower()
+        self.gemini_wake_window_seconds = max(1.0, float(gemini_wake_window_seconds))
         self._queue: asyncio.Queue[StreamSignal] = asyncio.Queue(maxsize=512)
         self._tasks: list[asyncio.Task] = []
         self._host_speaking = False
@@ -64,6 +76,11 @@ class LiveCutRuntime:
         self._processed_signals = 0
         self._last_signal_ts: datetime | None = None
         self._pending_vlm_scene_task: asyncio.Task | None = None
+        self._last_vlm_context_forward_ts: float = 0.0
+        self._last_vlm_context_fingerprint: str = ""
+        self._pending_vlm_context_text: str | None = None
+        self._pending_vlm_context_fingerprint: str | None = None
+        self._last_gemini_wake_word_ts: float = 0.0
 
     async def start(self) -> None:
         producers = [
@@ -136,11 +153,20 @@ class LiveCutRuntime:
             f"- Host mic input: {self.input_host_mic}\n"
             f"- Airhorn source: {self.source_sfx_airhorn}\n"
             f"- Host prompt source: {self.source_host_prompt_text}\n"
+            "Available tool names:\n"
+            f"- {', '.join(schema.get('name', '') for schema in self.tools.tool_schemas)}\n"
+            "Audio command examples:\n"
+            "- 'Show this image on stream' -> use inject_broll_from_url(url=..., source_name optional)\n"
+            "- 'Switch to chat scene' -> use switch_scene(scene_name=...)\n"
+            "- 'Highlight this comment' -> use highlight_question(question=...)\n"
             "Use only exact source/scene names from this context."
         )
         try:
-            await self.gemini_bridge.send_user_text(context_text)
-            logger.info("Sent startup control-room context to Gemini")
+            sent = await self.gemini_bridge.send_user_text_safe(context_text)
+            if sent:
+                logger.info("Sent startup control-room context to Gemini")
+            else:
+                logger.warning("Skipped startup context send because Gemini is reconnecting")
         except Exception:  # noqa: BLE001
             logger.exception("Failed to send startup context to Gemini")
 
@@ -209,6 +235,12 @@ class LiveCutRuntime:
             else:
                 self._host_speaking = True
                 self._last_host_speech_ts = signal.ts
+
+            if signal.kind == "speech" and self.gemini_require_wake_word:
+                spoken = str(signal.payload.get("text", "")).strip().lower()
+                if spoken and self.gemini_voice_wake_word and self.gemini_voice_wake_word in spoken:
+                    self._last_gemini_wake_word_ts = asyncio.get_event_loop().time()
+                    logger.info("Wake word detected; Gemini command window opened for %.1fs", self.gemini_wake_window_seconds)
             return
 
         if signal.source == "vision" and signal.kind == "frame_analysis":
@@ -229,12 +261,18 @@ class LiveCutRuntime:
             text = f"You've been on this topic for {minutes} minutes. Time for Q&A."  # host prompt hook
             await self.tools.execute("show_lower_third", {"text": text, "source_name": self.source_host_prompt_text})
             if self.gemini_bridge is not None:
-                await self.gemini_bridge.inject_system_message(text)
+                sent = await self.gemini_bridge.inject_system_message_safe(text)
+                if not sent:
+                    logger.warning("Skipped Gemini segment-timeout prompt because bridge is reconnecting")
             return
 
         if signal.source == "chat" and signal.kind == "chat_batch":
             messages = signal.payload.get("messages", [])
-            if self.gemini_bridge is not None and messages:
+            allow_gemini_chat_actions = True
+            if self.gemini_chat_actions_only_in_chat_scene:
+                allow_gemini_chat_actions = await self._is_chat_scene_active()
+
+            if self.gemini_bridge is not None and messages and allow_gemini_chat_actions:
                 prompt = (
                     "You are the stream producer. From this chat batch, pick the single best question and "
                     "call highlight_question(question=...). Chat batch:\n- " + "\n- ".join(str(m) for m in messages)
@@ -244,10 +282,16 @@ class LiveCutRuntime:
                     logger.info("Forwarded chat batch to Gemini for question selection")
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to forward chat batch to Gemini")
+            elif self.gemini_bridge is not None and messages and not allow_gemini_chat_actions:
+                logger.info("Skipping Gemini chat-batch action prompt because chat scene is not active")
 
             best_question = self._pick_question(messages)
-            if best_question:
+            if best_question and self.gemini_bridge is None:
                 await self.tools.execute("highlight_question", {"question": best_question})
+            return
+
+        if signal.source == "vlm" and signal.kind == "director_context":
+            await self._handle_vlm_director_context(signal.payload)
             return
 
         if signal.source in {"gemini", "vlm"} and signal.kind == "tool_call":
@@ -262,6 +306,7 @@ class LiveCutRuntime:
 
         if signal.source == "gemini" and signal.kind == "setup_complete":
             logger.info("Gemini setup complete acknowledged by runtime")
+            await self._flush_pending_vlm_context()
 
     async def _execute_model_tool_call(self, payload: dict[str, Any], source: str) -> None:
         tool_name = payload.get("name")
@@ -279,6 +324,23 @@ class LiveCutRuntime:
 
         result: dict[str, Any]
         try:
+            if source == "gemini" and self.gemini_require_wake_word and not self._is_wake_word_window_open():
+                logger.info(
+                    "Ignored Gemini tool call %s because wake word '%s' was not detected recently",
+                    tool_name,
+                    self.gemini_voice_wake_word,
+                )
+                result = {
+                    "ok": False,
+                    "error": (
+                        f"Wake word required: say '{self.gemini_voice_wake_word}' before issuing a command"
+                    ),
+                    "tool": tool_name,
+                }
+                if source == "gemini" and self.gemini_bridge is not None and call_id:
+                    await self.gemini_bridge.send_tool_result(call_id=call_id, tool_name=tool_name, result=result)
+                return
+
             switch_delay_seconds = (
                 self.vlm_scene_switch_delay_seconds if source == "vlm" else self.gemini_scene_switch_delay_seconds
             )
@@ -308,6 +370,82 @@ class LiveCutRuntime:
 
         if source == "gemini" and self.gemini_bridge is not None and call_id:
             await self.gemini_bridge.send_tool_result(call_id=call_id, tool_name=tool_name, result=result)
+
+    async def _handle_vlm_director_context(self, payload: dict[str, Any]) -> None:
+        kill_detected = bool(payload.get("kill_detected", False))
+        summary = str(payload.get("summary", "")).strip()
+        focus = str(payload.get("focus", "neutral")).strip().lower()
+        needs_gemini_action = bool(payload.get("needs_gemini_action", False))
+
+        if kill_detected:
+            await self.tools.execute("play_sfx", {"source_name": self.source_sfx_airhorn})
+
+        if not self.gemini_use_vlm_context or self.gemini_bridge is None:
+            return
+
+        await self._flush_pending_vlm_context()
+
+        now = asyncio.get_event_loop().time()
+        fingerprint = f"{focus}|{kill_detected}|{needs_gemini_action}|{summary}"
+        if fingerprint == self._last_vlm_context_fingerprint:
+            return
+        if now - self._last_vlm_context_forward_ts < self.gemini_vlm_context_min_interval_seconds:
+            return
+
+        director_text = (
+            "NVIDIA director context:\n"
+            f"- focus: {focus or 'neutral'}\n"
+            f"- kill_detected: {kill_detected}\n"
+            f"- needs_gemini_action: {needs_gemini_action}\n"
+            f"- summary: {summary or 'n/a'}\n"
+            "Use this context only when a tool action is necessary."
+        )
+        try:
+            sent = await self.gemini_bridge.send_user_text_safe(director_text)
+            if sent:
+                self._last_vlm_context_forward_ts = now
+                self._last_vlm_context_fingerprint = fingerprint
+                self._pending_vlm_context_text = None
+                self._pending_vlm_context_fingerprint = None
+                logger.info("Forwarded VLM director context to Gemini")
+            else:
+                self._pending_vlm_context_text = director_text
+                self._pending_vlm_context_fingerprint = fingerprint
+                logger.warning("Queued latest VLM director context while Gemini is reconnecting")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to forward VLM director context to Gemini")
+
+    async def _flush_pending_vlm_context(self) -> None:
+        if self.gemini_bridge is None:
+            return
+        if self._pending_vlm_context_text is None:
+            return
+        if self._pending_vlm_context_fingerprint is None:
+            return
+
+        sent = await self.gemini_bridge.send_user_text_safe(self._pending_vlm_context_text)
+        if not sent:
+            return
+
+        self._last_vlm_context_forward_ts = asyncio.get_event_loop().time()
+        self._last_vlm_context_fingerprint = self._pending_vlm_context_fingerprint
+        self._pending_vlm_context_text = None
+        self._pending_vlm_context_fingerprint = None
+        logger.info("Flushed queued VLM director context to Gemini")
+
+    async def _is_chat_scene_active(self) -> bool:
+        try:
+            current = await self.tools.obs.get_current_program_scene_name()
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to resolve current OBS scene while gating chat actions")
+            return False
+        return current == self.scene_chatting_focus
+
+    def _is_wake_word_window_open(self) -> bool:
+        if self._last_gemini_wake_word_ts <= 0:
+            return False
+        now = asyncio.get_event_loop().time()
+        return (now - self._last_gemini_wake_word_ts) <= self.gemini_wake_window_seconds
 
     def _schedule_delayed_vlm_scene_switch(self, scene_name: str, delay_seconds: float) -> None:
         if self._pending_vlm_scene_task is not None and not self._pending_vlm_scene_task.done():

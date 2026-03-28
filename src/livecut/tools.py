@@ -24,6 +24,7 @@ class ToolRegistry:
         source_lower_third_text: str,
         source_chat_question_text: str,
         source_sfx_airhorn: str,
+        source_broll_image: str,
         allowed_scene_names: list[str] | tuple[str, ...] | None = None,
         scene_min_dwell_seconds: float = 0.0,
     ) -> None:
@@ -34,6 +35,7 @@ class ToolRegistry:
         self.source_lower_third_text = source_lower_third_text
         self.source_chat_question_text = source_chat_question_text
         self.source_sfx_airhorn = source_sfx_airhorn
+        self.source_broll_image = source_broll_image
         self.allowed_scene_names = set(allowed_scene_names or [])
         self.scene_min_dwell_seconds = max(0.0, float(scene_min_dwell_seconds))
         self._last_scene_switch_ts: float | None = None
@@ -56,7 +58,7 @@ class ToolRegistry:
             {"name": "show_lower_third", "description": "Set lower-third text source", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["text"]}},
             {"name": "toggle_overlay", "description": "Show or hide overlay source in a scene", "parameters": {"type": "object", "properties": {"scene_name": {"type": "string"}, "source_name": {"type": "string"}, "visible": {"type": "boolean"}}, "required": ["scene_name", "source_name", "visible"]}},
             {"name": "play_sfx", "description": "Play SFX media source", "parameters": {"type": "object", "properties": {"source_name": {"type": "string"}}, "required": ["source_name"]}},
-            {"name": "inject_broll_from_url", "description": "Download image and route to OBS image source", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["url", "source_name"]}},
+            {"name": "inject_broll_from_url", "description": "Download image and route to OBS image source", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["url"]}},
             {"name": "highlight_question", "description": "Push highlighted chat question to text source", "parameters": {"type": "object", "properties": {"question": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["question"]}},
         ]
 
@@ -127,7 +129,9 @@ class ToolRegistry:
 
     async def inject_broll_from_url(self, args: dict) -> dict:
         url = args["url"]
-        source_name = args["source_name"]
+        source_name = args.get("source_name", self.source_broll_image)
+        if not isinstance(source_name, str) or source_name != self.source_broll_image:
+            source_name = self.source_broll_image
 
         filename = url.split("?")[0].split("/")[-1] or "broll.jpg"
         local_path = self.assets_dir / filename

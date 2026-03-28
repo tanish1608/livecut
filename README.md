@@ -14,6 +14,39 @@ LiveCut is a low-latency Python middleware that turns multimodal AI decisions in
 - Gemini live bridge with reconnects, keepalive prompts, and realtime media ingestion (mic + optional camera)
 - Optional NVIDIA Nemotron VLM bridge for 1s frame-based vision decisions
 
+## Role Split (Recommended)
+
+- NVIDIA VLM = live director and vision context feed (plus kill detection)
+- Gemini Live = execution agent for tool calls (voice commands + selective autonomous actions)
+- OBS tools = final action layer with safety guards
+
+This mode keeps direction and execution separate so you can talk to the director while Gemini handles concrete OBS operations.
+
+## Simple Voice Assistant Mode (Recommended for reliability)
+
+This mode removes the continuous Gemini Live stream loop and uses a simpler architecture:
+
+- Chrome Web Speech hears your voice.
+- Wake word detection happens in the browser (say: `gemini ...`).
+- The command text is sent to Gemini command model.
+- LiveCut executes one OBS tool call and speaks confirmation using macOS `say`.
+
+Enable in `.env`:
+
+- `GEMINI_SIMPLE_ASSISTANT_MODE=true`
+- `GEMINI_COMMAND_MODEL=gemini-2.5-flash`
+- `CHROME_LISTENER_HOST=127.0.0.1`
+- `CHROME_LISTENER_PORT=8765`
+- `CHROME_AUTO_OPEN=true`
+- `GEMINI_VOICE_WAKE_WORD=gemini`
+- `GEMINI_SPEAK_REPLIES=true`
+
+For simple assistant mode, keep these disabled to reduce noise:
+
+- `ENABLE_VLM=false`
+- `GEMINI_VIDEO_ENABLED=false`
+- `RUN_SIMULATION_LOOPS_WITH_GEMINI=false`
+
 ## Project layout
 
 - `src/livecut/obs_controller.py`: OBS command execution (obsws-python)
@@ -107,6 +140,25 @@ Configure these in `.env` for Gemini streaming:
 - `GEMINI_SCENE_SWITCH_DELAY_SECONDS` (delay before executing Gemini `switch_scene`; use 2-6s to give AI more scene context)
 - `SCENE_MIN_DWELL_SECONDS` (minimum time between scene switches to avoid thrash)
 
+Voice assistant command mode:
+
+- `GEMINI_VOICE_ASSISTANT_MODE=true` (opt-in voice-command behavior)
+- `GEMINI_REQUIRE_WAKE_WORD=true` (execute only when wake word is present)
+- `GEMINI_VOICE_WAKE_WORD=gemini` (example command: "Gemini, switch to chatting scene")
+- `GEMINI_WAKE_WINDOW_SECONDS=8` (tool calls allowed only shortly after wake word is heard)
+- `LIVE_RESPONSE_MODALITIES=` (leave empty to auto-pick; native-audio models will use `AUDIO`)
+- `GEMINI_AUDIO_OUTPUT_ENABLED=true` (play Gemini voice replies on your speaker)
+- `GEMINI_AUDIO_OUTPUT_DEVICE=` (optional output device index/name)
+
+Minimal personal-assistant setup (simple mode):
+
+- `ENABLE_GEMINI=true`
+- `ENABLE_VLM=false`
+- `GEMINI_VIDEO_ENABLED=false`
+- `RUN_SIMULATION_LOOPS_WITH_GEMINI=false`
+- `GEMINI_USE_VLM_CONTEXT=false`
+- Speak commands like: "Gemini, switch to chatting scene" or "Gemini, show this image on stream ..."
+
 NVIDIA VLM controls:
 
 - `ENABLE_VLM=true|false`
@@ -122,6 +174,23 @@ NVIDIA VLM controls:
 - `VLM_ERROR_BACKOFF_BASE_SECONDS` (backoff on transient VLM 5xx errors)
 - `VLM_ERROR_BACKOFF_MAX_SECONDS` (maximum 5xx backoff cap)
 - `VLM_SYSTEM_INSTRUCTION` (optional override)
+
+Director mode controls:
+
+- `VLM_ROLE=director`
+- `VLM_ENABLE_TOOL_CALLS=false` (recommended; VLM emits context, not direct tool calls)
+- `VLM_KILL_DETECTION_ENABLED=true`
+- `VLM_KILL_KEYWORDS=eliminated,knocked,kill,frag,headshot`
+
+Gemini execution-from-context controls:
+
+- `GEMINI_USE_VLM_CONTEXT=true`
+- `GEMINI_VLM_CONTEXT_MIN_INTERVAL_SECONDS=2.0`
+- `GEMINI_CHAT_ACTIONS_ONLY_IN_CHAT_SCENE=true`
+
+Image/b-roll controls:
+
+- `SOURCE_BROLL_IMAGE` (default target for `inject_broll_from_url` so voice commands can pull up images)
 
 ## Debugging Checklist
 

@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 class NvidiaVLMBridge:
     """Polling bridge for NVIDIA-hosted vision-language models.
 
-    The bridge captures a frame on a fixed interval, asks the VLM for
-    OBS action recommendations, and emits each recommendation as a tool-call signal.
+    The bridge captures a frame on a fixed interval and emits structured
+    director context for downstream routing. Optional tool-call passthrough
+    can be enabled for advanced modes.
     """
 
     def __init__(
@@ -41,6 +42,10 @@ class NvidiaVLMBridge:
         action_cooldown_seconds: float = 5.0,
         error_backoff_base_seconds: float = 1.0,
         error_backoff_max_seconds: float = 8.0,
+        role: str = "director",
+        enable_tool_calls: bool = False,
+        kill_detection_enabled: bool = True,
+        kill_keywords: list[str] | None = None,
         system_instruction: str | None = None,
     ) -> None:
         self.model = model
@@ -59,6 +64,10 @@ class NvidiaVLMBridge:
         self.action_cooldown_seconds = max(0.0, float(action_cooldown_seconds))
         self.error_backoff_base_seconds = max(0.25, float(error_backoff_base_seconds))
         self.error_backoff_max_seconds = max(self.error_backoff_base_seconds, float(error_backoff_max_seconds))
+        self.role = role.strip().lower() if role else "director"
+        self.enable_tool_calls = bool(enable_tool_calls)
+        self.kill_detection_enabled = bool(kill_detection_enabled)
+        self.kill_keywords = [k.strip().lower() for k in (kill_keywords or []) if isinstance(k, str) and k.strip()]
         self.system_instruction = system_instruction
 
         self._connected = False
@@ -116,7 +125,7 @@ class NvidiaVLMBridge:
                 continue
 
             try:
-                summary, actions = await self._infer_actions(frame_bytes)
+                director = await self._infer_director_context(frame_bytes)
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status >= 500:
@@ -137,10 +146,23 @@ class NvidiaVLMBridge:
                 continue
 
             self._error_backoff_seconds = self.error_backoff_base_seconds
-
+            summary = str(director.get("summary", "")).strip()
             if summary and summary != self._last_summary_text:
                 self._last_summary_text = summary
                 yield StreamSignal(source="vlm", kind="assistant_transcript", payload={"text": summary})
+
+            context_payload = {
+                "summary": summary,
+                "focus": str(director.get("focus", "neutral")),
+                "kill_detected": bool(director.get("kill_detected", False)),
+                "needs_gemini_action": bool(director.get("needs_gemini_action", False)),
+                "requested_actions": director.get("requested_actions", []),
+            }
+            yield StreamSignal(source="vlm", kind="director_context", payload=context_payload)
+
+            actions = director.get("actions", []) if self.enable_tool_calls else []
+            if not isinstance(actions, list):
+                actions = []
 
             for action in actions:
                 if not self._is_action_allowed_now(action):
@@ -161,15 +183,17 @@ class NvidiaVLMBridge:
             if sleep_seconds > 0:
                 await asyncio.sleep(sleep_seconds)
 
-    async def _infer_actions(self, frame_bytes: bytes) -> tuple[str, list[dict[str, Any]]]:
+    async def _infer_director_context(self, frame_bytes: bytes) -> dict[str, Any]:
         client = self._require_client()
         frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
 
         tool_names = sorted(self._tool_names)
         system_text = self.system_instruction or self._default_system_instruction()
         user_text = (
-            "Analyze the frame and propose immediate OBS actions. "
-            "Return strict JSON with fields: summary (string) and actions (array). "
+            "Analyze the frame and return strict JSON with fields: "
+            "summary (string), focus (gameplay|chatting|neutral), "
+            "kill_detected (boolean), needs_gemini_action (boolean), "
+            "requested_actions (array of short action intents), actions (array). "
             "Each action item must be {name: string, arguments: object}. "
             "If no action is needed, return actions as an empty array. "
             f"Allowed tools: {tool_names}. "
@@ -203,6 +227,23 @@ class NvidiaVLMBridge:
         parsed = self._parse_json_payload(content)
 
         summary = str(parsed.get("summary", "")).strip()
+        focus = str(parsed.get("focus", "neutral")).strip().lower()
+        if focus not in {"gameplay", "chatting", "neutral"}:
+            focus = "neutral"
+
+        requested_actions = parsed.get("requested_actions", [])
+        if not isinstance(requested_actions, list):
+            requested_actions = []
+
+        kill_detected = bool(parsed.get("kill_detected", False))
+        if self.kill_detection_enabled and not kill_detected and summary:
+            s = summary.lower()
+            kill_detected = any(k in s for k in self.kill_keywords)
+
+        needs_gemini_action = bool(parsed.get("needs_gemini_action", False))
+        if focus == "chatting":
+            needs_gemini_action = True
+
         raw_actions = parsed.get("actions", [])
         if not isinstance(raw_actions, list):
             raw_actions = []
@@ -229,9 +270,22 @@ class NvidiaVLMBridge:
             if len(actions) >= self.max_actions_per_turn:
                 break
 
-        return summary, actions
+        return {
+            "summary": summary,
+            "focus": focus,
+            "kill_detected": kill_detected,
+            "needs_gemini_action": needs_gemini_action,
+            "requested_actions": [str(x) for x in requested_actions[:6]],
+            "actions": actions,
+        }
 
     def _default_system_instruction(self) -> str:
+        if self.role == "director":
+            return (
+                "You are the live director. Describe what is happening and emit concise director context. "
+                "Prioritize kill detection and whether Gemini should act. "
+                "Do not output OBS tool actions unless explicitly required."
+            )
         return (
             "You are a live stream producer. Decide only the minimum safe OBS tool actions from visuals. "
             "Never invent scene/source names. Avoid rapid scene thrashing."

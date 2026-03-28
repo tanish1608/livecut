@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import suppress
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable, Callable
@@ -60,6 +61,8 @@ class GeminiLiveBridge:
         video_width: int = 1280,
         video_height: int = 720,
         video_jpeg_quality: int = 70,
+        audio_output_enabled: bool = True,
+        audio_output_device: str | None = None,
         video_frame_provider: Callable[[], Awaitable[bytes | None]] | None = None,
     ) -> None:
         self.model = model
@@ -82,6 +85,8 @@ class GeminiLiveBridge:
         self.audio_sample_rate_hz = max(8000, int(audio_sample_rate_hz))
         self.audio_blocksize_frames = max(256, int(audio_blocksize_frames))
         self.audio_input_device = self._parse_audio_device(audio_input_device)
+        self.audio_output_enabled = audio_output_enabled
+        self.audio_output_device = self._parse_audio_device(audio_output_device)
         self.video_device_index = int(video_device_index)
         self.video_fps = max(0.2, float(video_fps))
         self.video_width = max(160, int(video_width))
@@ -96,6 +101,9 @@ class GeminiLiveBridge:
         self._receive_message_count = 0
         self._audio_queue: asyncio.Queue[bytes] | None = None
         self._audio_stream: Any | None = None
+        self._audio_output_queue: asyncio.Queue[tuple[bytes, int]] | None = None
+        self._audio_output_stream: Any | None = None
+        self._audio_output_rate_hz: int | None = None
         self._media_tasks: list[asyncio.Task] = []
         self._bootstrap_sent = False
 
@@ -171,6 +179,31 @@ class GeminiLiveBridge:
     async def send_user_text(self, text: str) -> None:
         session = self._require_session()
         await session.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
+
+    async def send_user_text_safe(self, text: str) -> bool:
+        """Best-effort user-text send that never raises.
+
+        Returns True when the message is accepted by the active live session,
+        False when disconnected or when the websocket is in a reconnect window.
+        """
+        if not self.is_connected:
+            return False
+        try:
+            await self.send_user_text(text)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemini send_user_text skipped/failed during reconnect: %s", exc)
+            return False
+
+    async def inject_system_message_safe(self, text: str) -> bool:
+        if not self.is_connected:
+            return False
+        try:
+            await self.inject_system_message(text)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemini inject_system_message skipped/failed during reconnect: %s", exc)
+            return False
 
     async def send_tool_result(self, call_id: str, tool_name: str, result: dict[str, Any]) -> None:
         session = self._require_session()
@@ -275,6 +308,8 @@ class GeminiLiveBridge:
                 elif "end" in activity_type:
                     yield StreamSignal(source="audio", kind="speech_end", payload={"speaker": "host"})
 
+            await self._handle_output_audio(msg)
+
     def _build_tool_declaration(self) -> types.Tool:
         function_declarations: list[types.FunctionDeclaration] = []
         for schema in self.tool_schemas:
@@ -362,6 +397,9 @@ class GeminiLiveBridge:
         if self.audio_enabled:
             self._start_audio_capture(session)
 
+        if self.audio_output_enabled:
+            self._start_audio_playback()
+
         if self.video_enabled:
             self._start_video_capture(session)
 
@@ -379,7 +417,15 @@ class GeminiLiveBridge:
                 self._audio_stream.close()
             self._audio_stream = None
 
+        if self._audio_output_stream is not None:
+            with suppress(Exception):
+                self._audio_output_stream.stop()
+                self._audio_output_stream.close()
+            self._audio_output_stream = None
+            self._audio_output_rate_hz = None
+
         self._audio_queue = None
+        self._audio_output_queue = None
 
     def _start_audio_capture(self, session: Any) -> None:
         if sd is None:
@@ -457,6 +503,105 @@ class GeminiLiveBridge:
             sent_chunks += 1
             if sent_chunks % 100 == 0:
                 logger.info("Gemini audio sender heartbeat | chunks=%d", sent_chunks)
+
+    def _start_audio_playback(self) -> None:
+        if sd is None:
+            logger.warning("sounddevice not available; skipping Gemini audio playback")
+            return
+
+        self._audio_output_queue = asyncio.Queue(maxsize=256)
+        task = asyncio.create_task(self._audio_playback_loop(), name="gemini_audio_playback")
+        task.add_done_callback(self._log_media_task_error)
+        self._media_tasks.append(task)
+        logger.info("Gemini audio playback started (device=%s)", self.audio_output_device)
+
+    async def _handle_output_audio(self, msg: Any) -> None:
+        if not self.audio_output_enabled:
+            return
+        queue = self._audio_output_queue
+        if queue is None:
+            return
+
+        server_content = getattr(msg, "server_content", None)
+        interrupted = bool(getattr(server_content, "interrupted", False))
+        if interrupted:
+            self._clear_audio_output_queue()
+
+        model_turn = getattr(server_content, "model_turn", None)
+        parts = list(getattr(model_turn, "parts", []) or [])
+        for part in parts:
+            inline = getattr(part, "inline_data", None)
+            if inline is None:
+                continue
+            mime_type = str(getattr(inline, "mime_type", "") or "").lower()
+            if not mime_type.startswith("audio/pcm"):
+                continue
+            data = getattr(inline, "data", None)
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            rate_hz = self._parse_pcm_rate_hz(mime_type) or self.audio_sample_rate_hz
+            if queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            queue.put_nowait((bytes(data), rate_hz))
+
+    async def _audio_playback_loop(self) -> None:
+        while self._connected:
+            queue = self._audio_output_queue
+            if queue is None:
+                return
+
+            chunk, rate_hz = await queue.get()
+            stream = self._ensure_audio_output_stream(rate_hz)
+            if stream is None:
+                continue
+
+            await asyncio.to_thread(stream.write, chunk)
+
+    def _ensure_audio_output_stream(self, rate_hz: int) -> Any | None:
+        if sd is None:
+            return None
+
+        if self._audio_output_stream is not None and self._audio_output_rate_hz == rate_hz:
+            return self._audio_output_stream
+
+        if self._audio_output_stream is not None:
+            with suppress(Exception):
+                self._audio_output_stream.stop()
+                self._audio_output_stream.close()
+            self._audio_output_stream = None
+
+        try:
+            self._audio_output_stream = sd.RawOutputStream(
+                samplerate=rate_hz,
+                blocksize=self.audio_blocksize_frames,
+                dtype="int16",
+                channels=1,
+                device=self.audio_output_device,
+            )
+            self._audio_output_stream.start()
+            self._audio_output_rate_hz = rate_hz
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to start Gemini audio playback stream (device=%s rate=%s)",
+                self.audio_output_device,
+                rate_hz,
+            )
+            self._audio_output_stream = None
+            self._audio_output_rate_hz = None
+            return None
+
+        return self._audio_output_stream
+
+    def _clear_audio_output_queue(self) -> None:
+        queue = self._audio_output_queue
+        if queue is None:
+            return
+        while True:
+            with suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+                continue
+            break
 
     async def _video_sender_loop(self, session: Any) -> None:
         if self.video_frame_provider is not None:
@@ -551,10 +696,27 @@ class GeminiLiveBridge:
             return int(cleaned)
         return cleaned
 
+    @staticmethod
+    def _parse_pcm_rate_hz(mime_type: str) -> int | None:
+        match = re.search(r"rate=(\d+)", mime_type)
+        if not match:
+            return None
+        try:
+            rate = int(match.group(1))
+        except ValueError:
+            return None
+        if rate <= 0:
+            return None
+        return rate
+
     def _require_session(self) -> Any:
         if not self._connected or self._session is None:
             raise RuntimeError("Gemini bridge not connected")
         return self._session
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._session is not None
 
     @staticmethod
     def _log_media_task_error(task: asyncio.Task) -> None:
