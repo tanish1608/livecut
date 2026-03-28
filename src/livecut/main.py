@@ -210,10 +210,11 @@ async def run() -> None:
         assets_dir=Path("assets/broll"),
         cough_recovery_seconds=settings.cough_recovery_seconds,
         source_lower_third_text=settings.source_lower_third_text,
+        source_host_prompt_text=settings.source_host_prompt_text,
         source_chat_question_text=settings.source_chat_question_text,
         source_sfx_airhorn=settings.source_sfx_airhorn,
         source_broll_image=settings.source_broll_image,
-        allowed_scene_names=[settings.scene_gameplay_focus, settings.scene_chatting_focus],
+        allowed_scene_names=(validation["available_scenes"] if settings.gemini_simple_assistant_mode else [settings.scene_gameplay_focus, settings.scene_chatting_focus]),
         scene_min_dwell_seconds=settings.scene_min_dwell_seconds,
     )
 

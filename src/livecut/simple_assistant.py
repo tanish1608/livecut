@@ -254,31 +254,34 @@ class SimpleVoiceAssistant:
         logger.info("Wake command: %s", command)
         decision = await self._plan_tool_call(command)
 
-        tool_name = str(decision.get("tool_name", "")).strip()
-        args = decision.get("arguments", {})
-        if not isinstance(args, dict):
-            args = {}
+        actions = self._extract_actions(decision)
         speak_text = str(decision.get("speak", "")).strip()
 
-        if tool_name:
-            try:
-                result = await self.tools.execute(tool_name, args)
-                logger.info("Assistant executed tool=%s result=%s", tool_name, result)
-                if not speak_text:
-                    speak_text = f"Done. {tool_name.replace('_', ' ')} complete."
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Assistant tool execution failed")
-                speak_text = f"I could not execute {tool_name}. {exc}"
+        if actions:
+          executed: list[str] = []
+          try:
+            for tool_name, args in actions:
+              result = await self.tools.execute(tool_name, args)
+              logger.info("Assistant executed tool=%s result=%s", tool_name, result)
+              executed.append(tool_name)
+            if not speak_text:
+              if len(executed) == 1:
+                speak_text = f"Done. {executed[0].replace('_', ' ')} complete."
+              else:
+                speak_text = "Done. Executed multiple actions."
+          except Exception as exc:  # noqa: BLE001
+            logger.exception("Assistant tool execution failed")
+            failed = executed[-1] if executed else "requested action"
+            speak_text = f"I could not execute {failed}. {exc}"
         elif not speak_text:
-            speak_text = "I heard you. Please give me a specific stream command."
+          speak_text = "I heard you. Please give me a specific stream command."
 
         await self._speak(speak_text)
 
     async def _plan_tool_call(self, command: str) -> dict[str, Any]:
         tool_names = [schema.get("name") for schema in self.tools.tool_schemas if isinstance(schema.get("name"), str)]
         schema_hint = {
-            "tool_name": "string or empty",
-            "arguments": "object",
+            "actions": [{"tool_name": "string", "arguments": {}}],
             "speak": "short response to user",
         }
         prompt = (
@@ -293,7 +296,9 @@ class SimpleVoiceAssistant:
             f"- host prompt source: {self.source_host_prompt_text}\n"
             f"- chat question source: {self.source_chat_question_text}\n"
             f"- broll image source: {self.source_broll_image}\n"
-            "If no tool is needed, set tool_name to empty string and provide speak.\n"
+            "Prioritize text overlay commands with show_lower_third, show_host_prompt, highlight_question and the clear_* variants.\n"
+            "For visibility commands, use show_source_current_scene or hide_source_current_scene.\n"
+            "Use one or more actions when useful. If no tool is needed, set actions to an empty list.\n"
             f"User command: {command}"
         )
 
@@ -305,7 +310,7 @@ class SimpleVoiceAssistant:
         raw = await asyncio.to_thread(_request)
         parsed = self._parse_json(raw)
         if parsed is None:
-            return {"tool_name": "", "arguments": {}, "speak": raw.strip() or "Sorry, I did not understand."}
+          return {"actions": [], "speak": raw.strip() or "Sorry, I did not understand."}
         return parsed
 
     @staticmethod
@@ -324,6 +329,32 @@ class SimpleVoiceAssistant:
         if not isinstance(parsed, dict):
             return None
         return parsed
+
+    @staticmethod
+    def _extract_actions(decision: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        actions_raw = decision.get("actions", [])
+        actions: list[tuple[str, dict[str, Any]]] = []
+        if isinstance(actions_raw, list):
+            for item in actions_raw[:4]:
+                if not isinstance(item, dict):
+                    continue
+                tool_name = str(item.get("tool_name", "")).strip()
+                args = item.get("arguments", {})
+                if not tool_name:
+                    continue
+                if not isinstance(args, dict):
+                    args = {}
+                actions.append((tool_name, args))
+
+        # Backward compatibility for old single-action format.
+        if not actions:
+            tool_name = str(decision.get("tool_name", "")).strip()
+            args = decision.get("arguments", {})
+            if tool_name:
+                if not isinstance(args, dict):
+                    args = {}
+                actions.append((tool_name, args))
+        return actions
 
     async def _speak(self, text: str) -> None:
         if not text:

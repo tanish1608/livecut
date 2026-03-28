@@ -47,6 +47,21 @@ For simple assistant mode, keep these disabled to reduce noise:
 - `GEMINI_VIDEO_ENABLED=false`
 - `RUN_SIMULATION_LOOPS_WITH_GEMINI=false`
 
+Voice commands now support broader OBS control, including:
+
+- scene switches: `switch_scene`
+- text overlays: `show_lower_third`, `clear_lower_third`, `show_host_prompt`, `clear_host_prompt`, `highlight_question`, `clear_chat_question`
+- source visibility in current scene: `show_source_current_scene`, `hide_source_current_scene`
+- audio controls: `mute_input`, `unmute_input`, `momentary_mute`, `play_sfx`
+- b-roll image injection: `inject_broll_from_url`
+
+Examples:
+
+- "Gemini, show lower third saying welcome everyone"
+- "Gemini, highlight question what sensitivity do you use"
+- "Gemini, hide source webcam"
+- "Gemini, switch to intro scene and show host prompt we're starting now"
+
 ## Project layout
 
 - `src/livecut/obs_controller.py`: OBS command execution (obsws-python)
