@@ -4,6 +4,8 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from datetime import datetime, timedelta
+from typing import Any
 
 from .gemini_bridge import GeminiLiveBridge
 from .signal_loops import chat_batch_loop, fake_audio_loop, fake_vision_loop, segment_timer_loop
@@ -41,6 +43,8 @@ class LiveCutRuntime:
         self.gemini_bridge = gemini_bridge
         self._queue: asyncio.Queue[StreamSignal] = asyncio.Queue(maxsize=512)
         self._tasks: list[asyncio.Task] = []
+        self._host_speaking = False
+        self._last_host_speech_ts: datetime | None = None
 
     async def start(self) -> None:
         producers = [
@@ -90,7 +94,18 @@ class LiveCutRuntime:
 
     async def _dispatch(self, signal: StreamSignal) -> None:
         if signal.source == "audio" and signal.kind == "transient_spike":
+            if self._is_host_currently_speaking():
+                logger.info("Ignoring transient spike while host is speaking")
+                return
             await self.tools.execute("momentary_mute", {"input_name": self.input_host_mic})
+            return
+
+        if signal.source == "audio" and signal.kind in {"speech", "speech_start", "speech_end"}:
+            if signal.kind == "speech_end":
+                self._host_speaking = False
+            else:
+                self._host_speaking = True
+                self._last_host_speech_ts = signal.ts
             return
 
         if signal.source == "vision" and signal.kind == "frame_analysis":
@@ -109,6 +124,8 @@ class LiveCutRuntime:
             minutes = signal.payload.get("minutes", self.segment_minutes)
             text = f"You've been on this topic for {minutes} minutes. Time for Q&A."  # host prompt hook
             await self.tools.execute("show_lower_third", {"text": text, "source_name": self.source_host_prompt_text})
+            if self.gemini_bridge is not None:
+                await self.gemini_bridge.inject_system_message(text)
             return
 
         if signal.source == "chat" and signal.kind == "chat_batch":
@@ -116,6 +133,41 @@ class LiveCutRuntime:
             best_question = self._pick_question(messages)
             if best_question:
                 await self.tools.execute("highlight_question", {"question": best_question})
+            return
+
+        if signal.source == "gemini" and signal.kind == "tool_call":
+            await self._execute_gemini_tool_call(signal.payload)
+
+    async def _execute_gemini_tool_call(self, payload: dict[str, Any]) -> None:
+        tool_name = payload.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            logger.warning("Discarding gemini tool call without a valid name: %s", payload)
+            return
+
+        arguments = payload.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        call_id = payload.get("id")
+        if call_id is not None and not isinstance(call_id, str):
+            call_id = None
+
+        result: dict[str, Any]
+        try:
+            result = await self.tools.execute(tool_name, arguments)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Gemini tool call failed: %s", tool_name)
+            result = {"ok": False, "error": str(exc), "tool": tool_name}
+
+        if self.gemini_bridge is not None and call_id:
+            await self.gemini_bridge.send_tool_result(call_id=call_id, tool_name=tool_name, result=result)
+
+    def _is_host_currently_speaking(self) -> bool:
+        if self._host_speaking:
+            return True
+        if self._last_host_speech_ts is None:
+            return False
+        return (datetime.utcnow() - self._last_host_speech_ts) <= timedelta(milliseconds=850)
 
     @staticmethod
     def _pick_question(messages: list[str]) -> str | None:

@@ -11,7 +11,9 @@ class Settings(BaseSettings):
     google_genai_use_vertexai: bool = Field(default=False, alias="GOOGLE_GENAI_USE_VERTEXAI")
     google_cloud_project: str | None = Field(default=None, alias="GOOGLE_CLOUD_PROJECT")
     google_cloud_location: str = Field(default="us-central1", alias="GOOGLE_CLOUD_LOCATION")
-    live_model: str = Field(default="gemini-2.5-flash-preview-native-audio-dialog", alias="LIVE_MODEL")
+    live_model: str = Field(default="gemini-3.1-flash-live-preview", alias="LIVE_MODEL")
+    live_system_instruction: str | None = Field(default=None, alias="LIVE_SYSTEM_INSTRUCTION")
+    live_response_modalities: str | None = Field(default=None, alias="LIVE_RESPONSE_MODALITIES")
 
     obs_host: str = Field(default="127.0.0.1", alias="OBS_HOST")
     obs_port: int = Field(default=4455, alias="OBS_PORT")

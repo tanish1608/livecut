@@ -20,6 +20,14 @@ def configure_logging() -> None:
     )
 
 
+def parse_response_modalities(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    parts = [part.strip().upper() for part in value.split(",")]
+    modes = [part for part in parts if part]
+    return modes or None
+
+
 async def run() -> None:
     load_dotenv()
     configure_logging()
@@ -63,7 +71,20 @@ async def run() -> None:
         source_sfx_airhorn=settings.source_sfx_airhorn,
     )
 
-    gemini_bridge = GeminiLiveBridge(settings.live_model) if settings.enable_gemini else None
+    gemini_bridge = (
+        GeminiLiveBridge(
+            model=settings.live_model,
+            tool_schemas=tools.tool_schemas,
+            use_vertexai=settings.google_genai_use_vertexai,
+            api_key=settings.google_api_key,
+            project=settings.google_cloud_project,
+            location=settings.google_cloud_location,
+            system_instruction=settings.live_system_instruction,
+            response_modalities=parse_response_modalities(settings.live_response_modalities),
+        )
+        if settings.enable_gemini
+        else None
+    )
 
     runtime = LiveCutRuntime(
         tools=tools,
