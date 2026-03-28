@@ -11,7 +11,8 @@ LiveCut is a low-latency Python middleware that turns multimodal AI decisions in
   - audio transient handling (cough/sneeze style auto-mute)
   - segment timeout prompts
   - periodic chat question highlighting
-- Gemini bridge boundary (`GeminiLiveBridge`) so you can wire the exact Gemini Live SDK flow without refactoring runtime logic
+- Gemini live bridge with reconnects, keepalive prompts, and realtime media ingestion (mic + optional camera)
+- Optional NVIDIA Nemotron VLM bridge for 1s frame-based vision decisions
 
 ## Project layout
 
@@ -57,10 +58,26 @@ If your OBS scene/source names differ, set these in `.env` to match your exact n
 ## Current behavior
 
 - With `ENABLE_GEMINI=false` (default), LiveCut runs in simulation mode and still controls OBS in real time.
-- With `ENABLE_GEMINI=true`, runtime initializes `GeminiLiveBridge`. The bridge file is where to plug in:
-  - camera/audio frame ingestion
-  - tool-call extraction from Gemini responses
-  - context injection messages (segment warnings, etc.)
+- With `ENABLE_GEMINI=true`, runtime initializes `GeminiLiveBridge` and streams:
+  - microphone PCM chunks to Gemini Live (`GEMINI_AUDIO_ENABLED=true`)
+  - optional camera frames as JPEG (`GEMINI_VIDEO_ENABLED=true`)
+  - tool-call extraction and execution via `ToolRegistry`
+  - context injection messages (segment warnings, chat prompts)
+- Gemini mode now includes:
+  - receive idle diagnostics and runtime heartbeat logs
+  - optional keepalive text prompts (`GEMINI_KEEPALIVE_SECONDS`)
+  - automatic reconnect when the live receive stream ends (`GEMINI_AUTO_RECONNECT`)
+  - optional bootstrap user turn on connect (`GEMINI_BOOTSTRAP_USER_TEXT`)
+  - optional hybrid mode (`RUN_SIMULATION_LOOPS_WITH_GEMINI=true`) to keep local signal loops active alongside Gemini
+  - realtime microphone streaming to Gemini (`GEMINI_AUDIO_ENABLED=true`)
+  - OBS program scene frame streaming at low FPS (default video mode)
+  - optional direct camera-device mode (`GEMINI_VIDEO_SOURCE_MODE=camera_device`)
+  - startup control-room context injection so model uses exact OBS scene/source names
+- With `ENABLE_VLM=true`, runtime initializes `NvidiaVLMBridge` and:
+  - captures OBS screenshots on a fixed interval (`VLM_POLL_SECONDS`, default 1.0s)
+  - calls NVIDIA OpenAI-compatible endpoint (`VLM_BASE_URL`)
+  - parses structured action JSON and emits tool calls into the same safe `ToolRegistry`
+  - can run in parallel with Gemini so vision and audio are split across models
 
 ## Feature mapping from your design
 
@@ -72,16 +89,53 @@ If your OBS scene/source names differ, set these in `.env` to match your exact n
 - Chat highlighting: `chat_batch_loop` + `_pick_question` + `tools.highlight_question`
 - Segment timers: `segment_timer_loop` + `show_lower_third` host prompt source
 
-## Next integration step (Gemini Live)
+## Realtime Input Controls
 
-Implement these inside `GeminiLiveBridge`:
+Configure these in `.env` for Gemini streaming:
 
-- persistent live session setup
-- frame/audio streaming to Gemini
-- streaming receive loop that yields `StreamSignal` objects
-- function-call passthrough to `ToolRegistry.execute`
+- `GEMINI_AUDIO_ENABLED=true|false`
+- `GEMINI_VIDEO_ENABLED=true|false`
+- `GEMINI_AUDIO_INPUT_DEVICE` (optional device index or name)
+- `GEMINI_VIDEO_DEVICE_INDEX`
+- `GEMINI_VIDEO_SOURCE_MODE` (`obs_program_scene` or `camera_device`)
+- `GEMINI_VIDEO_SOURCE_NAME` (optional; defaults to current OBS program scene)
+- `GEMINI_VIDEO_FPS`
+- `GEMINI_VIDEO_WIDTH`
+- `GEMINI_VIDEO_HEIGHT`
+- `GEMINI_VIDEO_JPEG_QUALITY`
+- `AI_ONLY_SCENE_SWITCHING` (`true` disables local vision scene heuristics so only Gemini tool calls can switch scenes)
+- `GEMINI_SCENE_SWITCH_DELAY_SECONDS` (delay before executing Gemini `switch_scene`; use 2-6s to give AI more scene context)
+- `SCENE_MIN_DWELL_SECONDS` (minimum time between scene switches to avoid thrash)
 
-This separation keeps the hard real-time OBS control logic stable while you iterate on prompt and model behavior.
+NVIDIA VLM controls:
+
+- `ENABLE_VLM=true|false`
+- `VLM_MODEL` (example: `nvidia/nemotron-nano-12b-v2-vl`)
+- `VLM_BASE_URL` (example: `https://integrate.api.nvidia.com`)
+- `NVIDIA_API_KEY`
+- `VLM_POLL_SECONDS` (set `1.0` for per-second frame decisions)
+- `VLM_REQUEST_TIMEOUT_SECONDS`
+- `VLM_MAX_ACTIONS_PER_TURN`
+- `VLM_ALLOWED_TOOLS` (comma-separated allowlist, recommended: `switch_scene`)
+- `VLM_ACTION_COOLDOWN_SECONDS` (dedupe repeat actions, recommended: `3-8`)
+- `VLM_SCENE_SWITCH_DELAY_SECONDS` (separate delay for VLM scene switches; use `0.8-2.0` for low-latency)
+- `VLM_ERROR_BACKOFF_BASE_SECONDS` (backoff on transient VLM 5xx errors)
+- `VLM_ERROR_BACKOFF_MAX_SECONDS` (maximum 5xx backoff cap)
+- `VLM_SYSTEM_INSTRUCTION` (optional override)
+
+## Debugging Checklist
+
+1. Confirm stream ingestion logs:
+  - `Gemini audio capture started`
+  - `Gemini audio sender heartbeat`
+  - `Gemini video sender heartbeat` (if video enabled)
+2. Confirm model events:
+  - `Gemini tool-call event with ...`
+  - `Gemini assistant transcript: ...`
+3. Confirm execution:
+  - `Executing Gemini tool call: ...`
+  - OBS action logs (`Switched scene`, `Updated text source`, etc.)
+  - `Applying Gemini scene switch delay of ...s before switch_scene` (when Gemini requests a scene switch)
 
 ## Testing
 

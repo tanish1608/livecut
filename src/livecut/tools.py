@@ -24,6 +24,8 @@ class ToolRegistry:
         source_lower_third_text: str,
         source_chat_question_text: str,
         source_sfx_airhorn: str,
+        allowed_scene_names: list[str] | tuple[str, ...] | None = None,
+        scene_min_dwell_seconds: float = 0.0,
     ) -> None:
         self.obs = obs
         self.assets_dir = assets_dir
@@ -32,6 +34,10 @@ class ToolRegistry:
         self.source_lower_third_text = source_lower_third_text
         self.source_chat_question_text = source_chat_question_text
         self.source_sfx_airhorn = source_sfx_airhorn
+        self.allowed_scene_names = set(allowed_scene_names or [])
+        self.scene_min_dwell_seconds = max(0.0, float(scene_min_dwell_seconds))
+        self._last_scene_switch_ts: float | None = None
+        self._last_scene_name: str | None = None
         self._tools: dict[str, ToolFn] = {
             "switch_scene": self.switch_scene,
             "momentary_mute": self.momentary_mute,
@@ -61,8 +67,33 @@ class ToolRegistry:
         return await fn(arguments)
 
     async def switch_scene(self, args: dict) -> dict:
-        scene_name = args["scene_name"]
+        scene_name = args.get("scene_name")
+        if not isinstance(scene_name, str) or not scene_name:
+            return {"ok": False, "error": "missing_or_invalid_scene_name"}
+        if self.allowed_scene_names and scene_name not in self.allowed_scene_names:
+            logger.warning("Rejected switch_scene for unknown scene: %s", scene_name)
+            return {
+                "ok": False,
+                "error": "unknown_scene_name",
+                "scene": scene_name,
+                "allowed_scenes": sorted(self.allowed_scene_names),
+            }
+
+        now = asyncio.get_running_loop().time()
+        if self._last_scene_name == scene_name:
+            return {"ok": True, "scene": scene_name, "skipped": "already_active"}
+        if self._last_scene_switch_ts is not None and self.scene_min_dwell_seconds > 0:
+            age = now - self._last_scene_switch_ts
+            if age < self.scene_min_dwell_seconds:
+                return {
+                    "ok": False,
+                    "error": "scene_dwell_guard",
+                    "retry_in_seconds": max(0.0, self.scene_min_dwell_seconds - age),
+                }
+
         await self.obs.switch_scene(scene_name)
+        self._last_scene_switch_ts = now
+        self._last_scene_name = scene_name
         return {"ok": True, "scene": scene_name}
 
     async def momentary_mute(self, args: dict) -> dict:
@@ -75,6 +106,8 @@ class ToolRegistry:
     async def show_lower_third(self, args: dict) -> dict:
         text = args["text"]
         source_name = args.get("source_name", self.source_lower_third_text)
+        if not isinstance(source_name, str) or source_name != self.source_lower_third_text:
+            source_name = self.source_lower_third_text
         await self.obs.set_text_source(source_name, text)
         return {"ok": True, "source": source_name}
 
@@ -87,6 +120,8 @@ class ToolRegistry:
 
     async def play_sfx(self, args: dict) -> dict:
         source_name = args.get("source_name", self.source_sfx_airhorn)
+        if not isinstance(source_name, str) or source_name != self.source_sfx_airhorn:
+            source_name = self.source_sfx_airhorn
         await self.obs.play_media_source(source_name)
         return {"ok": True, "source": source_name}
 
@@ -108,6 +143,8 @@ class ToolRegistry:
     async def highlight_question(self, args: dict) -> dict:
         question = args["question"]
         source_name = args.get("source_name", self.source_chat_question_text)
+        if not isinstance(source_name, str) or source_name != self.source_chat_question_text:
+            source_name = self.source_chat_question_text
         await self.obs.set_text_source(source_name, question)
         return {"ok": True, "source": source_name}
 

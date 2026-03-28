@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,39 @@ class OBSController:
             client = self._require_client()
             await asyncio.to_thread(client.set_current_program_scene, scene_name)
             logger.info("Switched scene to %s", scene_name)
+
+    async def get_current_program_scene_name(self) -> str:
+        async with self._lock:
+            client = self._require_client()
+            response = await asyncio.to_thread(client.get_current_program_scene)
+        name = getattr(response, "current_program_scene_name", None)
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("Failed to resolve current program scene name")
+        return name
+
+    async def get_source_screenshot_jpeg(
+        self,
+        source_name: str,
+        width: int,
+        height: int,
+        quality: int,
+    ) -> bytes:
+        async with self._lock:
+            client = self._require_client()
+            response = await asyncio.to_thread(client.get_source_screenshot, source_name, "jpg", width, height, quality)
+
+        image_data = getattr(response, "image_data", None)
+        if not isinstance(image_data, str) or not image_data:
+            raise RuntimeError(f"Empty screenshot payload for source: {source_name}")
+
+        marker = "base64,"
+        marker_idx = image_data.find(marker)
+        if marker_idx >= 0:
+            encoded = image_data[marker_idx + len(marker) :]
+        else:
+            encoded = image_data
+
+        return base64.b64decode(encoded)
 
     async def set_mic_mute(self, input_name: str, muted: bool) -> None:
         async with self._lock:
