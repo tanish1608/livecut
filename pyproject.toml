@@ -1,0 +1,27 @@
+[project]
+name = "livecut"
+version = "0.1.0"
+description = "LiveCut multimodal AI producer bridge for OBS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "obsws-python>=1.7.0",
+  "python-dotenv>=1.0.1",
+  "pydantic>=2.8.2",
+  "pydantic-settings>=2.4.0",
+  "httpx>=0.27.0",
+  "google-genai>=1.12.1",
+]
+
+[project.scripts]
+livecut = "livecut.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
