@@ -144,16 +144,30 @@ class OBSController:
     async def set_source_visible(self, scene_name: str, source_name: str, visible: bool) -> None:
         async with self._lock:
             client = self._require_client()
-            scene_items = await asyncio.to_thread(client.get_scene_item_list, scene_name)
-            item_id = None
-            for item in scene_items.scene_items:
-                if item["sourceName"] == source_name:
-                    item_id = item["sceneItemId"]
-                    break
+            item_id = await self._find_scene_item_id(client, scene_name, source_name)
             if item_id is None:
                 raise ValueError(f"Source {source_name} not found in scene {scene_name}")
             await asyncio.to_thread(client.set_scene_item_enabled, scene_name, item_id, visible)
             logger.info("Set source %s visible=%s in scene %s", source_name, visible, scene_name)
+
+    async def set_source_visible_in_all_scenes(self, source_name: str, visible: bool) -> int:
+        async with self._lock:
+            client = self._require_client()
+            scene_response = await asyncio.to_thread(client.get_scene_list)
+            scenes_raw = getattr(scene_response, "scenes", [])
+            updated = 0
+            for scene in scenes_raw:
+                scene_name = scene.get("sceneName") if isinstance(scene, dict) else getattr(scene, "sceneName", None)
+                if not isinstance(scene_name, str) or not scene_name:
+                    continue
+                item_id = await self._find_scene_item_id(client, scene_name, source_name)
+                if item_id is None:
+                    continue
+                await asyncio.to_thread(client.set_scene_item_enabled, scene_name, item_id, visible)
+                updated += 1
+
+            logger.info("Set source %s visible=%s in %d scene(s)", source_name, visible, updated)
+            return updated
 
     async def set_image_source_file(self, source_name: str, image_path: Path) -> None:
         async with self._lock:
@@ -180,3 +194,10 @@ class OBSController:
         if not self._client:
             raise RuntimeError("OBS client is not connected")
         return self._client
+
+    async def _find_scene_item_id(self, client: ReqClient, scene_name: str, source_name: str) -> int | None:
+        scene_items = await asyncio.to_thread(client.get_scene_item_list, scene_name)
+        for item in scene_items.scene_items:
+            if item["sourceName"] == source_name:
+                return item["sceneItemId"]
+        return None

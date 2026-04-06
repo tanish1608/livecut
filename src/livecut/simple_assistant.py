@@ -5,6 +5,7 @@ import json
 import logging
 import subprocess
 import webbrowser
+from contextlib import suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -13,6 +14,7 @@ from typing import Any
 from google import genai
 
 from .tools import ToolRegistry
+from .vlm_bridge import NvidiaVLMBridge
 
 logger = logging.getLogger(__name__)
 
@@ -171,10 +173,29 @@ class ChromeWakeListener:
         loop = asyncio.get_running_loop()
         _ChromeSpeechHandler.queue = self._queue
         _ChromeSpeechHandler.loop = loop
-        self._server = ThreadingHTTPServer((self.host, self.port), _ChromeSpeechHandler)
+        requested_port = self.port
+        self._server = None
+        last_error: OSError | None = None
+        for offset in range(0, 10):
+            candidate_port = requested_port + offset
+            try:
+                self._server = ThreadingHTTPServer((self.host, candidate_port), _ChromeSpeechHandler)
+                self.port = candidate_port
+                break
+            except OSError as exc:
+                last_error = exc
+                continue
+
+        if self._server is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Failed to start Chrome wake listener")
+
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         url = f"http://{self.host}:{self.port}/"
+        if self.port != requested_port:
+            logger.warning("Chrome wake listener port %s busy; using %s", requested_port, self.port)
         logger.info("Chrome wake listener started at %s", url)
         if self.auto_open:
             webbrowser.open(url)
@@ -209,7 +230,15 @@ class SimpleVoiceAssistant:
         source_sfx_airhorn: str,
         source_host_prompt_text: str,
         source_chat_question_text: str,
+        source_chat_question_image: str | None,
         source_broll_image: str,
+        available_scene_names: list[str] | None = None,
+        available_input_names: list[str] | None = None,
+        vlm_bridge: NvidiaVLMBridge | None = None,
+        kill_celebration_text: str = "ELIMINATION!",
+        kill_celebration_duration_seconds: float = 2.5,
+        kill_celebration_cooldown_seconds: float = 4.0,
+        source_celebration_overlay: str | None = None,
     ) -> None:
         self.tools = tools
         self.listener = listener
@@ -220,17 +249,69 @@ class SimpleVoiceAssistant:
         self.source_sfx_airhorn = source_sfx_airhorn
         self.source_host_prompt_text = source_host_prompt_text
         self.source_chat_question_text = source_chat_question_text
+        self.source_chat_question_image = source_chat_question_image
         self.source_broll_image = source_broll_image
+        self.available_scene_names = [name for name in (available_scene_names or []) if isinstance(name, str) and name]
+        self.available_input_names = [name for name in (available_input_names or []) if isinstance(name, str) and name]
+        self.vlm_bridge = vlm_bridge
+        self.kill_celebration_text = (kill_celebration_text or "ELIMINATION!").strip() or "ELIMINATION!"
+        self.kill_celebration_duration_seconds = max(0.4, float(kill_celebration_duration_seconds))
+        self.kill_celebration_cooldown_seconds = max(0.0, float(kill_celebration_cooldown_seconds))
+        self.source_celebration_overlay = source_celebration_overlay
+        self._last_kill_celebration_ts: float = 0.0
 
     async def run(self) -> None:
+        vlm_task: asyncio.Task | None = None
         await self.listener.start()
+        if self.vlm_bridge is not None:
+            await self.vlm_bridge.connect()
+            vlm_task = asyncio.create_task(self._vlm_watch_loop(), name="simple_assistant_vlm_watch")
         try:
             await self._speak("Voice assistant ready. Say Gemini followed by your command.")
             while True:
                 transcript = await self.listener.next_transcript()
                 await self._handle_transcript(transcript)
         finally:
+            if vlm_task is not None:
+                vlm_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await vlm_task
+            if self.vlm_bridge is not None:
+                await self.vlm_bridge.disconnect()
             await self.listener.stop()
+
+    async def _vlm_watch_loop(self) -> None:
+        if self.vlm_bridge is None:
+            return
+        async for signal in self.vlm_bridge.signals():
+            if signal.source != "vlm" or signal.kind != "director_context":
+                continue
+            payload = signal.payload
+            if not isinstance(payload, dict):
+                continue
+            if not bool(payload.get("kill_detected", False)):
+                continue
+            confidence = float(payload.get("kill_confidence", 0.0) or 0.0)
+            logger.info("Simple assistant VLM kill detected (confidence=%.2f)", confidence)
+            await self._trigger_kill_celebration()
+
+    async def _trigger_kill_celebration(self) -> None:
+        now = asyncio.get_event_loop().time()
+        if self.kill_celebration_cooldown_seconds > 0:
+            age = now - self._last_kill_celebration_ts
+            if age < self.kill_celebration_cooldown_seconds:
+                return
+
+        self._last_kill_celebration_ts = now
+        await self.tools.execute(
+            "celebrate_kill",
+            {
+                "text": self.kill_celebration_text,
+                "duration_seconds": self.kill_celebration_duration_seconds,
+                "sfx_source": self.source_sfx_airhorn,
+                "overlay_source": self.source_celebration_overlay,
+            },
+        )
 
     async def _handle_transcript(self, transcript: str) -> None:
         cleaned = transcript.strip()
@@ -289,16 +370,23 @@ class SimpleVoiceAssistant:
             "Return strict JSON only. No markdown.\n"
             f"JSON schema: {json.dumps(schema_hint)}\n"
             f"Allowed tool names: {tool_names}\n"
+            f"Available OBS scenes: {self.available_scene_names}\n"
+            f"Available OBS inputs/sources: {self.available_input_names}\n"
             "Use these exact names when needed:\n"
             f"- gameplay scene: {self.scene_gameplay_focus}\n"
             f"- chatting scene: {self.scene_chatting_focus}\n"
             f"- airhorn source: {self.source_sfx_airhorn}\n"
             f"- host prompt source: {self.source_host_prompt_text}\n"
             f"- chat question source: {self.source_chat_question_text}\n"
+            f"- chat question image source: {self.source_chat_question_image or '(not configured)'}\n"
             f"- broll image source: {self.source_broll_image}\n"
             "Prioritize text overlay commands with show_lower_third, show_host_prompt, highlight_question and the clear_* variants.\n"
+            "For requests like 'show/pull up the chat question', use show_chat_question_panel.\n"
+            "For requests like 'hide/remove chat question panel', use hide_chat_question_panel.\n"
             "For visibility commands, use show_source_current_scene or hide_source_current_scene.\n"
-            "Use one or more actions when useful. If no tool is needed, set actions to an empty list.\n"
+            "Use one or more actions when useful.\n"
+            "If user asks a general question (not an OBS command), set actions to an empty list and answer in speak naturally.\n"
+            "Do not invent OBS scene/source names; if uncertain, explain briefly in speak.\n"
             f"User command: {command}"
         )
 

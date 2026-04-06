@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -24,8 +25,10 @@ class ToolRegistry:
         source_lower_third_text: str,
         source_host_prompt_text: str,
         source_chat_question_text: str,
+        source_chat_question_image: str | None,
         source_sfx_airhorn: str,
         source_broll_image: str,
+        source_celebration_overlay: str | None = None,
         allowed_scene_names: list[str] | tuple[str, ...] | None = None,
         scene_min_dwell_seconds: float = 0.0,
     ) -> None:
@@ -36,8 +39,10 @@ class ToolRegistry:
         self.source_lower_third_text = source_lower_third_text
         self.source_host_prompt_text = source_host_prompt_text
         self.source_chat_question_text = source_chat_question_text
+        self.source_chat_question_image = source_chat_question_image.strip() if isinstance(source_chat_question_image, str) and source_chat_question_image.strip() else None
         self.source_sfx_airhorn = source_sfx_airhorn
         self.source_broll_image = source_broll_image
+        self.source_celebration_overlay = source_celebration_overlay.strip() if isinstance(source_celebration_overlay, str) and source_celebration_overlay.strip() else None
         self.allowed_scene_names = set(allowed_scene_names or [])
         self.scene_min_dwell_seconds = max(0.0, float(scene_min_dwell_seconds))
         self._last_scene_switch_ts: float | None = None
@@ -58,6 +63,9 @@ class ToolRegistry:
             "inject_broll_from_url": self.inject_broll_from_url,
             "highlight_question": self.highlight_question,
             "clear_chat_question": self.clear_chat_question,
+            "show_chat_question_panel": self.show_chat_question_panel,
+            "hide_chat_question_panel": self.hide_chat_question_panel,
+            "celebrate_kill": self.celebrate_kill,
         }
 
     @property
@@ -78,6 +86,9 @@ class ToolRegistry:
             {"name": "inject_broll_from_url", "description": "Download image and route to OBS image source", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["url"]}},
             {"name": "highlight_question", "description": "Push highlighted chat question to text source", "parameters": {"type": "object", "properties": {"question": {"type": "string"}, "source_name": {"type": "string"}}, "required": ["question"]}},
             {"name": "clear_chat_question", "description": "Clear highlighted chat question text source", "parameters": {"type": "object", "properties": {"source_name": {"type": "string"}}}},
+            {"name": "show_chat_question_panel", "description": "Show chat question text/image panel without changing text", "parameters": {"type": "object", "properties": {}}},
+            {"name": "hide_chat_question_panel", "description": "Hide chat question text/image panel", "parameters": {"type": "object", "properties": {}}},
+            {"name": "celebrate_kill", "description": "Show a celebration effect and play SFX for a detected kill", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "duration_seconds": {"type": "number"}, "text_source": {"type": "string"}, "sfx_source": {"type": "string"}, "overlay_source": {"type": "string"}}}},
         ]
 
     async def execute(self, name: str, arguments: dict) -> dict:
@@ -215,6 +226,7 @@ class ToolRegistry:
             source_name = self.source_chat_question_text
         await self.obs.set_text_source(source_name, question)
         await self._ensure_source_visible_in_current_scene(source_name)
+        await self._set_optional_source_visibility(self.source_chat_question_image, True)
         return {"ok": True, "source": source_name}
 
     async def clear_chat_question(self, args: dict) -> dict:
@@ -222,15 +234,96 @@ class ToolRegistry:
         if not isinstance(source_name, str) or source_name != self.source_chat_question_text:
             source_name = self.source_chat_question_text
         await self.obs.set_text_source(source_name, "")
+        await self._set_optional_source_visibility(self.source_chat_question_image, False)
         return {"ok": True, "source": source_name}
+
+    async def show_chat_question_panel(self, args: dict) -> dict:
+        del args
+        await self._ensure_source_visible_in_current_scene(self.source_chat_question_text)
+        image_updated = await self._set_optional_source_visibility(self.source_chat_question_image, True)
+        return {"ok": True, "text_source": self.source_chat_question_text, "image_source": self.source_chat_question_image, "image_updated": image_updated}
+
+    async def hide_chat_question_panel(self, args: dict) -> dict:
+        del args
+        await self._set_optional_source_visibility(self.source_chat_question_text, False)
+        image_updated = await self._set_optional_source_visibility(self.source_chat_question_image, False)
+        return {"ok": True, "text_source": self.source_chat_question_text, "image_source": self.source_chat_question_image, "image_updated": image_updated}
+
+    async def celebrate_kill(self, args: dict) -> dict:
+        text = str(args.get("text", "ELIMINATION!")).strip() or "ELIMINATION!"
+        duration_seconds = max(0.4, float(args.get("duration_seconds", 2.5)))
+
+        text_source = args.get("text_source", self.source_host_prompt_text)
+        if not isinstance(text_source, str) or text_source != self.source_host_prompt_text:
+            text_source = self.source_host_prompt_text
+
+        sfx_source = args.get("sfx_source", self.source_sfx_airhorn)
+        if not isinstance(sfx_source, str) or sfx_source != self.source_sfx_airhorn:
+            sfx_source = self.source_sfx_airhorn
+
+        overlay_source = args.get("overlay_source", self.source_celebration_overlay)
+        if not isinstance(overlay_source, str) or not overlay_source.strip():
+            overlay_source = self.source_celebration_overlay
+
+        await self.obs.play_media_source(sfx_source)
+        await self.obs.set_text_source(text_source, text)
+        await self._ensure_source_visible_in_current_scene(text_source)
+
+        current_scene = await self.obs.get_current_program_scene_name()
+        if overlay_source:
+            try:
+                await self.obs.set_source_visible(current_scene, overlay_source, True)
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not show celebration overlay %s", overlay_source, exc_info=True)
+
+        task = asyncio.create_task(
+            self._end_kill_celebration(
+                duration_seconds=duration_seconds,
+                text_source=text_source,
+                overlay_source=overlay_source,
+                scene_name=current_scene,
+            ),
+            name="celebrate_kill:cleanup",
+        )
+        task.add_done_callback(self._log_task_error)
+        return {"ok": True, "text_source": text_source, "overlay_source": overlay_source, "duration_seconds": duration_seconds}
 
     async def _ensure_source_visible_in_current_scene(self, source_name: str) -> None:
         try:
-            scene_name = await self.obs.get_current_program_scene_name()
-            await self.obs.set_source_visible(scene_name, source_name, True)
+            updated = await self.obs.set_source_visible_in_all_scenes(source_name, True)
+            if updated == 0:
+                scene_name = await self.obs.get_current_program_scene_name()
+                await self.obs.set_source_visible(scene_name, source_name, True)
         except Exception:  # noqa: BLE001
             # Some sources may not exist in the current scene; ignore visibility failures.
-            logger.debug("Could not force source %s visible in current scene", source_name, exc_info=True)
+            logger.debug("Could not force source %s visible", source_name, exc_info=True)
+
+    async def _set_optional_source_visibility(self, source_name: str | None, visible: bool) -> int:
+        if not source_name:
+            return 0
+        try:
+            updated = await self.obs.set_source_visible_in_all_scenes(source_name, visible)
+            if updated == 0:
+                scene_name = await self.obs.get_current_program_scene_name()
+                await self.obs.set_source_visible(scene_name, source_name, visible)
+                return 1
+            return updated
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not set source %s visibility=%s", source_name, visible, exc_info=True)
+            return 0
+
+    async def _end_kill_celebration(
+        self,
+        duration_seconds: float,
+        text_source: str,
+        overlay_source: str | None,
+        scene_name: str,
+    ) -> None:
+        await asyncio.sleep(duration_seconds)
+        await self.obs.set_text_source(text_source, "")
+        if overlay_source:
+            with suppress(Exception):
+                await self.obs.set_source_visible(scene_name, overlay_source, False)
 
     @staticmethod
     def _log_task_error(task: asyncio.Task) -> None:

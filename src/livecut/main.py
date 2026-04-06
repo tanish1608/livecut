@@ -185,6 +185,10 @@ async def run() -> None:
         settings.scene_gameplay_focus,
         settings.scene_chatting_focus,
     ]
+    if settings.scene_intro:
+        required_scenes.append(settings.scene_intro)
+    if settings.scene_outro:
+        required_scenes.append(settings.scene_outro)
     required_inputs = [
         settings.input_host_mic,
         settings.source_sfx_airhorn,
@@ -193,6 +197,10 @@ async def run() -> None:
         settings.source_chat_question_text,
         settings.source_broll_image,
     ]
+    if settings.source_chat_question_image:
+        required_inputs.append(settings.source_chat_question_image)
+    if settings.source_celebration_overlay:
+        required_inputs.append(settings.source_celebration_overlay)
 
     validation = await obs.validate_required_objects(required_scenes, required_inputs)
     missing_scenes = validation["missing_scenes"]
@@ -212,8 +220,10 @@ async def run() -> None:
         source_lower_third_text=settings.source_lower_third_text,
         source_host_prompt_text=settings.source_host_prompt_text,
         source_chat_question_text=settings.source_chat_question_text,
+        source_chat_question_image=settings.source_chat_question_image,
         source_sfx_airhorn=settings.source_sfx_airhorn,
         source_broll_image=settings.source_broll_image,
+        source_celebration_overlay=settings.source_celebration_overlay,
         allowed_scene_names=(validation["available_scenes"] if settings.gemini_simple_assistant_mode else [settings.scene_gameplay_focus, settings.scene_chatting_focus]),
         scene_min_dwell_seconds=settings.scene_min_dwell_seconds,
     )
@@ -253,7 +263,43 @@ async def run() -> None:
             source_sfx_airhorn=settings.source_sfx_airhorn,
             source_host_prompt_text=settings.source_host_prompt_text,
             source_chat_question_text=settings.source_chat_question_text,
+            source_chat_question_image=settings.source_chat_question_image,
             source_broll_image=settings.source_broll_image,
+            available_scene_names=[str(name) for name in validation["available_scenes"] if isinstance(name, str)],
+            available_input_names=[str(name) for name in validation["available_inputs"] if isinstance(name, str)],
+            vlm_bridge=(
+                NvidiaVLMBridge(
+                    model=settings.vlm_model,
+                    base_url=settings.vlm_base_url,
+                    api_key=settings.nvidia_api_key,
+                    frame_provider=build_obs_frame_provider(obs),
+                    tool_schemas=tools.tool_schemas,
+                    scene_gameplay_focus=settings.scene_gameplay_focus,
+                    scene_chatting_focus=settings.scene_chatting_focus,
+                    source_sfx_airhorn=settings.source_sfx_airhorn,
+                    source_host_prompt_text=settings.source_host_prompt_text,
+                    source_chat_question_text=settings.source_chat_question_text,
+                    poll_seconds=settings.vlm_poll_seconds,
+                    request_timeout_seconds=settings.vlm_request_timeout_seconds,
+                    max_actions_per_turn=settings.vlm_max_actions_per_turn,
+                    allowed_tool_names=parse_csv_items(settings.vlm_allowed_tools),
+                    action_cooldown_seconds=settings.vlm_action_cooldown_seconds,
+                    error_backoff_base_seconds=settings.vlm_error_backoff_base_seconds,
+                    error_backoff_max_seconds=settings.vlm_error_backoff_max_seconds,
+                    role=settings.vlm_role,
+                    enable_tool_calls=False,
+                    kill_detection_enabled=settings.vlm_kill_detection_enabled,
+                    kill_keywords=parse_csv_items(settings.vlm_kill_keywords),
+                    kill_confidence_threshold=settings.vlm_kill_confidence_threshold,
+                    system_instruction=build_vlm_system_instruction(),
+                )
+                if settings.enable_vlm
+                else None
+            ),
+            kill_celebration_text=settings.kill_celebration_text,
+            kill_celebration_duration_seconds=settings.kill_celebration_duration_seconds,
+            kill_celebration_cooldown_seconds=settings.kill_celebration_cooldown_seconds,
+            source_celebration_overlay=settings.source_celebration_overlay,
         )
 
         try:
@@ -321,6 +367,7 @@ async def run() -> None:
             enable_tool_calls=settings.vlm_enable_tool_calls,
             kill_detection_enabled=settings.vlm_kill_detection_enabled,
             kill_keywords=parse_csv_items(settings.vlm_kill_keywords),
+            kill_confidence_threshold=settings.vlm_kill_confidence_threshold,
             system_instruction=build_vlm_system_instruction(),
         )
         if settings.enable_vlm
@@ -350,6 +397,10 @@ async def run() -> None:
         gemini_require_wake_word=settings.gemini_require_wake_word,
         gemini_voice_wake_word=settings.gemini_voice_wake_word,
         gemini_wake_window_seconds=settings.gemini_wake_window_seconds,
+        kill_celebration_text=settings.kill_celebration_text,
+        kill_celebration_duration_seconds=settings.kill_celebration_duration_seconds,
+        kill_celebration_cooldown_seconds=settings.kill_celebration_cooldown_seconds,
+        source_celebration_overlay=settings.source_celebration_overlay,
     )
 
     await runtime.start()

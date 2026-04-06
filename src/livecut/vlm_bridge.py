@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -46,6 +47,7 @@ class NvidiaVLMBridge:
         enable_tool_calls: bool = False,
         kill_detection_enabled: bool = True,
         kill_keywords: list[str] | None = None,
+        kill_confidence_threshold: float = 0.75,
         system_instruction: str | None = None,
     ) -> None:
         self.model = model
@@ -68,6 +70,7 @@ class NvidiaVLMBridge:
         self.enable_tool_calls = bool(enable_tool_calls)
         self.kill_detection_enabled = bool(kill_detection_enabled)
         self.kill_keywords = [k.strip().lower() for k in (kill_keywords or []) if isinstance(k, str) and k.strip()]
+        self.kill_confidence_threshold = min(1.0, max(0.0, float(kill_confidence_threshold)))
         self.system_instruction = system_instruction
 
         self._connected = False
@@ -155,6 +158,8 @@ class NvidiaVLMBridge:
                 "summary": summary,
                 "focus": str(director.get("focus", "neutral")),
                 "kill_detected": bool(director.get("kill_detected", False)),
+                "kill_confidence": float(director.get("kill_confidence", 0.0) or 0.0),
+                "kill_reason": str(director.get("kill_reason", "")),
                 "needs_gemini_action": bool(director.get("needs_gemini_action", False)),
                 "requested_actions": director.get("requested_actions", []),
             }
@@ -192,7 +197,7 @@ class NvidiaVLMBridge:
         user_text = (
             "Analyze the frame and return strict JSON with fields: "
             "summary (string), focus (gameplay|chatting|neutral), "
-            "kill_detected (boolean), needs_gemini_action (boolean), "
+            "kill_detected (boolean), kill_confidence (0..1 number), kill_reason (string), needs_gemini_action (boolean), "
             "requested_actions (array of short action intents), actions (array). "
             "Each action item must be {name: string, arguments: object}. "
             "If no action is needed, return actions as an empty array. "
@@ -235,10 +240,17 @@ class NvidiaVLMBridge:
         if not isinstance(requested_actions, list):
             requested_actions = []
 
-        kill_detected = bool(parsed.get("kill_detected", False))
-        if self.kill_detection_enabled and not kill_detected and summary:
-            s = summary.lower()
-            kill_detected = any(k in s for k in self.kill_keywords)
+        kill_detected_raw = bool(parsed.get("kill_detected", False))
+        kill_confidence = self._parse_kill_confidence(parsed.get("kill_confidence"))
+        kill_reason = str(parsed.get("kill_reason", "")).strip()
+        text_confidence = self._infer_kill_confidence_from_summary(summary)
+        if kill_detected_raw:
+            kill_confidence = max(kill_confidence, 0.72)
+        kill_confidence = max(kill_confidence, text_confidence)
+
+        kill_detected = False
+        if self.kill_detection_enabled:
+            kill_detected = kill_confidence >= self.kill_confidence_threshold
 
         needs_gemini_action = bool(parsed.get("needs_gemini_action", False))
         if focus == "chatting":
@@ -274,6 +286,8 @@ class NvidiaVLMBridge:
             "summary": summary,
             "focus": focus,
             "kill_detected": kill_detected,
+            "kill_confidence": kill_confidence,
+            "kill_reason": kill_reason,
             "needs_gemini_action": needs_gemini_action,
             "requested_actions": [str(x) for x in requested_actions[:6]],
             "actions": actions,
@@ -394,3 +408,36 @@ class NvidiaVLMBridge:
         if not self._connected or self._client is None:
             raise RuntimeError("NVIDIA VLM bridge not connected")
         return self._client
+
+    @staticmethod
+    def _parse_kill_confidence(value: Any) -> float:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return min(1.0, max(0.0, confidence))
+
+    def _infer_kill_confidence_from_summary(self, summary: str) -> float:
+        text = summary.strip().lower()
+        if not text:
+            return 0.0
+
+        confidence = 0.0
+        if any(k in text for k in self.kill_keywords):
+            confidence = max(confidence, 0.62)
+
+        if any(token in text for token in ("eliminated", "knocked", "killed", "headshot", "finished")):
+            confidence = max(confidence, 0.80)
+
+        # Pattern seen in killfeed summaries: "playerA knocked playerB"
+        if re.search(r"\b(eliminated|knocked|killed|headshot)\b", text):
+            confidence = max(confidence, 0.86)
+
+        # Avoid boosting generic combat narration without explicit killfeed evidence.
+        if "kill" in text and "notification" in text and confidence < 0.80:
+            confidence = min(confidence, 0.58)
+
+        if any(token in text for token in ("fighting", "combat", "shooting", "aiming")) and confidence < 0.80:
+            confidence = min(confidence, 0.55)
+
+        return confidence

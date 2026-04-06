@@ -196,6 +196,16 @@ Director mode controls:
 - `VLM_ENABLE_TOOL_CALLS=false` (recommended; VLM emits context, not direct tool calls)
 - `VLM_KILL_DETECTION_ENABLED=true`
 - `VLM_KILL_KEYWORDS=eliminated,knocked,kill,frag,headshot`
+- `VLM_KILL_CONFIDENCE_THRESHOLD=0.75` (raise to `0.80-0.90` for stricter kill confirmations)
+
+Kill celebration effect controls:
+
+- `KILL_CELEBRATION_TEXT=ELIMINATION!`
+- `KILL_CELEBRATION_DURATION_SECONDS=2.5`
+- `KILL_CELEBRATION_COOLDOWN_SECONDS=4.0`
+- `SOURCE_CELEBRATION_OVERLAY=` (optional OBS source to flash on kill)
+
+When a kill is confirmed, LiveCut now triggers a synchronized celebration: SFX + on-screen text + optional overlay flash.
 
 Gemini execution-from-context controls:
 

@@ -43,6 +43,10 @@ class LiveCutRuntime:
         gemini_require_wake_word: bool = False,
         gemini_voice_wake_word: str = "gemini",
         gemini_wake_window_seconds: float = 8.0,
+        kill_celebration_text: str = "ELIMINATION!",
+        kill_celebration_duration_seconds: float = 2.5,
+        kill_celebration_cooldown_seconds: float = 4.0,
+        source_celebration_overlay: str | None = None,
     ) -> None:
         self.tools = tools
         self.host_username = host_username
@@ -69,6 +73,10 @@ class LiveCutRuntime:
         self.gemini_require_wake_word = gemini_require_wake_word
         self.gemini_voice_wake_word = (gemini_voice_wake_word or "gemini").strip().lower()
         self.gemini_wake_window_seconds = max(1.0, float(gemini_wake_window_seconds))
+        self.kill_celebration_text = (kill_celebration_text or "ELIMINATION!").strip() or "ELIMINATION!"
+        self.kill_celebration_duration_seconds = max(0.4, float(kill_celebration_duration_seconds))
+        self.kill_celebration_cooldown_seconds = max(0.0, float(kill_celebration_cooldown_seconds))
+        self.source_celebration_overlay = source_celebration_overlay
         self._queue: asyncio.Queue[StreamSignal] = asyncio.Queue(maxsize=512)
         self._tasks: list[asyncio.Task] = []
         self._host_speaking = False
@@ -81,6 +89,7 @@ class LiveCutRuntime:
         self._pending_vlm_context_text: str | None = None
         self._pending_vlm_context_fingerprint: str | None = None
         self._last_gemini_wake_word_ts: float = 0.0
+        self._last_kill_celebration_ts: float = 0.0
 
     async def start(self) -> None:
         producers = [
@@ -253,7 +262,7 @@ class LiveCutRuntime:
 
             killfeed = str(signal.payload.get("killfeed", ""))
             if self.host_username.lower() in killfeed.lower():
-                await self.tools.execute("play_sfx", {"source_name": self.source_sfx_airhorn})
+                await self._trigger_kill_celebration()
             return
 
         if signal.source == "timer" and signal.kind == "segment_timeout":
@@ -373,12 +382,14 @@ class LiveCutRuntime:
 
     async def _handle_vlm_director_context(self, payload: dict[str, Any]) -> None:
         kill_detected = bool(payload.get("kill_detected", False))
+        kill_confidence = float(payload.get("kill_confidence", 0.0) or 0.0)
         summary = str(payload.get("summary", "")).strip()
         focus = str(payload.get("focus", "neutral")).strip().lower()
         needs_gemini_action = bool(payload.get("needs_gemini_action", False))
 
         if kill_detected:
-            await self.tools.execute("play_sfx", {"source_name": self.source_sfx_airhorn})
+            logger.info("Kill detected by VLM (confidence=%.2f)", kill_confidence)
+            await self._trigger_kill_celebration()
 
         if not self.gemini_use_vlm_context or self.gemini_bridge is None:
             return
@@ -396,6 +407,7 @@ class LiveCutRuntime:
             "NVIDIA director context:\n"
             f"- focus: {focus or 'neutral'}\n"
             f"- kill_detected: {kill_detected}\n"
+            f"- kill_confidence: {kill_confidence:.2f}\n"
             f"- needs_gemini_action: {needs_gemini_action}\n"
             f"- summary: {summary or 'n/a'}\n"
             "Use this context only when a tool action is necessary."
@@ -446,6 +458,24 @@ class LiveCutRuntime:
             return False
         now = asyncio.get_event_loop().time()
         return (now - self._last_gemini_wake_word_ts) <= self.gemini_wake_window_seconds
+
+    async def _trigger_kill_celebration(self) -> None:
+        now = asyncio.get_event_loop().time()
+        if self.kill_celebration_cooldown_seconds > 0:
+            age = now - self._last_kill_celebration_ts
+            if age < self.kill_celebration_cooldown_seconds:
+                return
+
+        self._last_kill_celebration_ts = now
+        await self.tools.execute(
+            "celebrate_kill",
+            {
+                "text": self.kill_celebration_text,
+                "duration_seconds": self.kill_celebration_duration_seconds,
+                "sfx_source": self.source_sfx_airhorn,
+                "overlay_source": self.source_celebration_overlay,
+            },
+        )
 
     def _schedule_delayed_vlm_scene_switch(self, scene_name: str, delay_seconds: float) -> None:
         if self._pending_vlm_scene_task is not None and not self._pending_vlm_scene_task.done():
