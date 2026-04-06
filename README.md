@@ -1,4 +1,4 @@
-# LiveCut: The Multimodal AI Producer
+# LiveCut: The Multimodal AI Producer for live streams
 
 LiveCut is a low-latency Python middleware that turns multimodal AI decisions into real OBS Studio actions.
 
